@@ -1,0 +1,345 @@
+#include <linux/module.h>
+
+#include <linux/kernel.h>
+
+#include <linux/init.h>
+
+#include <linux/kthread.h>
+
+#include <linux/semaphore.h>
+
+#include <linux/sched.h>
+
+#include <linux/sched/signal.h>
+
+#include <linux/slab.h>
+
+#include <linux/timekeeping.h>
+
+
+
+MODULE_LICENSE("GPL");
+
+MODULE_AUTHOR("Rockwell Jackson, Chase Sondrup, Dhruv Gupta, Zachariah Gass");
+
+MODULE_DESCRIPTION("Calculates the total elapsed time of all the processes that belong to a given user in the system.");
+
+MODULE_VERSION("0.1");
+
+
+
+static int buffSize = 0;
+
+module_param(buffSize, int, 0644);
+
+MODULE_PARM_DESC(buffSize, "The buffer size");
+
+
+
+static int prod = 0;
+
+module_param(prod, int, 0644);
+
+MODULE_PARM_DESC(prod, "# of producers (0 or 1)");
+
+
+
+static int cons = 0;
+
+module_param(cons, int, 0644);
+
+MODULE_PARM_DESC(cons, "# of consumers (a non-negative integer number)");
+
+
+
+static int uuid = 0;
+
+module_param(uuid, int, 0644);
+
+MODULE_PARM_DESC(uuid, "The UID of the user");
+
+
+
+typedef struct {
+
+    struct task_struct *task;
+
+} process_info_t;
+
+
+
+static process_info_t *buffer;
+
+static int head = 0;
+
+static int tail = 0;
+
+static int item_count = 0;
+
+static u64 total_elapsed_time = 0;
+
+
+
+static struct task_struct *producer_struct;
+
+static struct task_struct **consumer_structs;
+
+
+
+static struct semaphore mutex, full, empty;
+
+
+
+static int producer_func(void *arg) {
+
+    struct task_struct *task;
+
+    int item_num = 0;
+
+
+
+    for_each_process(task) {
+
+        if (task->cred->uid.val == uuid) {
+
+            if (down_interruptible(&empty))
+
+                return -EINTR;
+
+            down_interruptible(&mutex);
+
+
+
+            buffer[tail].task = task;
+
+            printk(KERN_INFO "[Producer-1] Produced Item#-%d at buffer index:%d for PID:%d\n", item_num, tail, task->pid);
+
+            tail = (tail + 1) % buffSize;
+
+            item_num++;
+
+            item_count++;
+
+
+
+            up(&mutex);
+
+            up(&full);
+
+        }
+
+    }
+
+
+
+    return 0;
+
+}
+
+
+
+static int consumer_func(void *arg) {
+
+    int consumer_id = *(int *)arg;
+
+    int item_num;
+
+
+
+    while (!kthread_should_stop()) {
+
+        if (down_interruptible(&full))
+
+            break;
+
+        down_interruptible(&mutex);
+
+
+
+        struct task_struct *task = buffer[head].task;
+
+        item_num = item_count - (buffSize - head);
+
+        u64 elapsed_time = ktime_get_ns() - task->start_time;
+
+        total_elapsed_time += elapsed_time;
+
+
+
+        printk(KERN_INFO "[Consumer-%d] Consumed Item#-%d on buffer index:%d PID:%d Elapsed Time-%llu:%llu:%llu\n",
+
+               consumer_id, item_num, head, task->pid,
+
+               elapsed_time / 3600000000000, (elapsed_time / 60000000000) % 60, (elapsed_time / 1000000000) % 60);
+
+
+
+        head = (head + 1) % buffSize;
+
+        item_count--;
+
+
+
+        up(&mutex);
+
+        up(&empty);
+
+    }
+
+
+
+    return 0;
+
+}
+
+
+
+static int __init init_threads(void) {
+
+    int i;
+
+
+
+    buffer = kmalloc(sizeof(process_info_t) * buffSize, GFP_KERNEL);
+
+    if (!buffer) {
+
+        printk(KERN_ERR "Failed to allocate buffer\n");
+
+        return -ENOMEM;
+
+    }
+
+
+
+    sema_init(&mutex, 1);
+
+    sema_init(&full, 0);
+
+    sema_init(&empty, buffSize);
+
+
+
+    if (prod > 0) {
+
+        producer_struct = kthread_run(producer_func, NULL, "Producer-1");
+
+        if (IS_ERR(producer_struct)) {
+
+            printk(KERN_ERR "Producer creation failed\n");
+
+            kfree(buffer);
+
+            return PTR_ERR(producer_struct);
+
+        }
+
+    }
+
+
+
+    if (cons > 0) {
+
+        consumer_structs = kmalloc(sizeof(struct task_struct *) * cons, GFP_KERNEL);
+
+        if (!consumer_structs) {
+
+            printk(KERN_ERR "Failed to allocate consumer array\n");
+
+            kthread_stop(producer_struct);
+
+            kfree(buffer);
+
+            return -ENOMEM;
+
+        }
+
+
+
+        for (i = 0; i < cons; i++) {
+
+            int *id = kmalloc(sizeof(int), GFP_KERNEL);
+
+            *id = i + 1;
+
+            consumer_structs[i] = kthread_run(consumer_func, id, "Consumer-%d", i + 1);
+
+            if (IS_ERR(consumer_structs[i])) {
+
+                printk(KERN_ERR "Consumer-%d creation failed\n", i + 1);
+
+                int j;
+
+                for (j = 0; j < i; j++)
+
+                    kthread_stop(consumer_structs[j]);
+
+                kfree(consumer_structs);
+
+                kthread_stop(producer_struct);
+
+                kfree(buffer);
+
+                return PTR_ERR(consumer_structs[i]);
+
+            }
+
+        }
+
+    }
+
+
+
+    return 0;
+
+}
+
+
+
+static void __exit cleanup_threads(void) {
+
+    int i;
+
+
+
+    if (prod > 0 && !IS_ERR(producer_struct))
+
+        kthread_stop(producer_struct);
+
+
+
+    if (cons > 0) {
+
+        for (i = 0; i < cons; i++) {
+
+            if (!IS_ERR(consumer_structs[i]))
+
+                kthread_stop(consumer_structs[i]);
+
+        }
+
+        kfree(consumer_structs);
+
+    }
+
+
+
+    kfree(buffer);
+
+
+
+    printk(KERN_INFO "The total elapsed time of all processes for UID %d is %llu:%llu:%llu\n",
+
+           uuid, total_elapsed_time / 3600000000000, (total_elapsed_time / 60000000000) % 60, (total_elapsed_time / 1000000000) % 60);
+
+
+
+    printk(KERN_INFO "Module cleanup complete\n");
+
+}
+
+
+
+module_init(init_threads);
+
+module_exit(cleanup_threads);
